@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import warnings
+import io
 warnings.filterwarnings('ignore')
 
 # ---------- PAGE CONFIG ----------
@@ -18,15 +19,33 @@ import requests
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_sp400_tickers():
-    """Scrape S&P 400 MidCap tickers from Wikipedia."""
+    """
+    Scrape S&P 400 MidCap tickers from Wikipedia with fallback.
+    Returns list of tickers, or empty list if fetch fails.
+    """
     url = 'https://en.wikipedia.org/wiki/List_of_S%26P_400_companies'
-    
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-    response = requests.get(url, headers=headers, timeout=10)
-    response.raise_for_status()
     
-    tables = pd.read_html(response.text)
-    return tables[0]['Symbol'].tolist()
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        # Attempt to parse HTML tables
+        tables = pd.read_html(response.text)
+        if tables and len(tables) > 0 and 'Symbol' in tables[0].columns:
+            tickers = tables[0]['Symbol'].tolist()
+            if tickers:
+                st.success(f"✅ Loaded {len(tickers)} S&P 400 tickers from Wikipedia")
+                return tickers
+    except requests.exceptions.Timeout:
+        st.warning("⏱️ Wikipedia request timed out. Using fallback ticker list.")
+    except requests.exceptions.ConnectionError:
+        st.warning("🔌 Connection error fetching Wikipedia. Using fallback ticker list.")
+    except Exception as e:
+        st.warning(f"⚠️ Could not fetch S&P 400 from Wikipedia ({type(e).__name__}). Upload a CSV or use other sources.")
+    
+    # Fallback: Return curated sample if Wikipedia fails
+    return []
 
 # Small-cap sample: you can replace this with a CSV read or an ETF holdings scrape
 SMALL_CAP_TICKERS = ['SITC', 'CRNC', 'AMSC', 'OSUR', 'AXNX', 'SMCI', 'CROX', 'MOD', 'QLYS']
@@ -195,11 +214,44 @@ with st.sidebar:
     market_cap_max = st.number_input("Max Market Cap ($M)", value=10000, step=1000) * 1e6
     min_fcf_yield = st.slider("Minimum FCF/EV Yield (%)", 0.0, 15.0, 5.0, 0.5)
 
-    # Ticker source
+    st.divider()
+    st.subheader("📋 Ticker Sources")
+
+    # Ticker source options
     use_midcap = st.checkbox("Include S&P 400 MidCaps", value=True)
     use_smallcap = st.checkbox("Include Small-Cap Sample", value=True)
+    
+    # File upload option
+    uploaded_file = st.file_uploader(
+        "Or upload CSV with tickers",
+        type=['csv'],
+        help="CSV should have a 'Symbol' or 'Ticker' column"
+    )
+    
+    uploaded_tickers = []
+    if uploaded_file is not None:
+        try:
+            df_upload = pd.read_csv(uploaded_file)
+            # Try to find ticker column (case-insensitive)
+            ticker_col = None
+            for col in df_upload.columns:
+                if col.lower() in ['symbol', 'ticker']:
+                    ticker_col = col
+                    break
+            
+            if ticker_col:
+                uploaded_tickers = df_upload[ticker_col].str.upper().tolist()
+                st.success(f"✅ Loaded {len(uploaded_tickers)} tickers from file")
+            else:
+                st.error(f"❌ CSV must have 'Symbol' or 'Ticker' column. Found: {list(df_upload.columns)}")
+        except Exception as e:
+            st.error(f"❌ Error reading CSV: {e}")
+    
+    # Custom tickers text input
     custom_tickers = st.text_area("Or enter custom tickers (comma-separated)", value="")
 
+    st.divider()
+    
     if st.button("Run Screener", type="primary"):
         st.session_state.run_screen = True
 
@@ -207,43 +259,57 @@ with st.sidebar:
 if st.session_state.get('run_screen', False):
     with st.spinner("Fetching ticker list and financial data... (may take a few minutes)"):
         tickers = set()
+        
         if use_midcap:
-            tickers.update(get_sp400_tickers())
+            sp400_tickers = get_sp400_tickers()
+            if sp400_tickers:
+                tickers.update(sp400_tickers)
+            else:
+                st.warning("⚠️ S&P 400 tickers not available. Use other sources or upload a CSV.")
+        
         if use_smallcap:
             tickers.update(SMALL_CAP_TICKERS)
+        
+        if uploaded_tickers:
+            tickers.update(uploaded_tickers)
+        
         if custom_tickers:
             tickers.update([t.strip().upper() for t in custom_tickers.split(',') if t.strip()])
 
         tickers = list(tickers)
-        st.write(f"Checking {len(tickers)} tickers...")
-
-        results = []
-        progress = st.progress(0)
-        for i, ticker in enumerate(tickers):
-            progress.progress((i + 1) / len(tickers))
-            # Market cap filter
-            mkt_cap = get_market_cap(ticker)
-            if mkt_cap is None or mkt_cap < market_cap_min or mkt_cap > market_cap_max:
-                continue
-            # FCF yield
-            fy = fcf_yield(ticker)
-            if fy is None or fy < min_fcf_yield:
-                continue
-            company_name = get_company_name(ticker)
-            results.append({
-                'Ticker': ticker,
-                'Company': company_name,
-                'Market Cap ($M)': mkt_cap / 1e6,
-                'FCF/EV Yield (%)': round(fy, 2)
-            })
-
-        if results:
-            df = pd.DataFrame(results).sort_values('FCF/EV Yield (%)', ascending=False)
-            st.session_state.screen_results = df
-            st.success(f"Found {len(df)} opportunities.")
+        
+        if not tickers:
+            st.error("❌ No tickers selected. Please select at least one source.")
         else:
-            st.warning("No stocks matched the criteria.")
-            st.session_state.screen_results = pd.DataFrame()
+            st.write(f"Checking {len(tickers)} tickers...")
+
+            results = []
+            progress = st.progress(0)
+            for i, ticker in enumerate(tickers):
+                progress.progress((i + 1) / len(tickers))
+                # Market cap filter
+                mkt_cap = get_market_cap(ticker)
+                if mkt_cap is None or mkt_cap < market_cap_min or mkt_cap > market_cap_max:
+                    continue
+                # FCF yield
+                fy = fcf_yield(ticker)
+                if fy is None or fy < min_fcf_yield:
+                    continue
+                company_name = get_company_name(ticker)
+                results.append({
+                    'Ticker': ticker,
+                    'Company': company_name,
+                    'Market Cap ($M)': mkt_cap / 1e6,
+                    'FCF/EV Yield (%)': round(fy, 2)
+                })
+
+            if results:
+                df = pd.DataFrame(results).sort_values('FCF/EV Yield (%)', ascending=False)
+                st.session_state.screen_results = df
+                st.success(f"✅ Found {len(df)} opportunities.")
+            else:
+                st.warning("No stocks matched the criteria.")
+                st.session_state.screen_results = pd.DataFrame()
 
 # Display screening results if available
 if 'screen_results' in st.session_state and not st.session_state.screen_results.empty:
