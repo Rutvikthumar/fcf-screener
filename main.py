@@ -14,11 +14,18 @@ st.set_page_config(
 )
 
 # ---------- CACHED DATA FETCHING ----------
+import requests
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_sp400_tickers():
     """Scrape S&P 400 MidCap tickers from Wikipedia."""
     url = 'https://en.wikipedia.org/wiki/List_of_S%26P_400_companies'
-    tables = pd.read_html(url)
+    
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    response = requests.get(url, headers=headers, timeout=10)
+    response.raise_for_status()
+    
+    tables = pd.read_html(response.text)
     return tables[0]['Symbol'].tolist()
 
 # Small-cap sample: you can replace this with a CSV read or an ETF holdings scrape
