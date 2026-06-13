@@ -35,7 +35,6 @@ def get_sp400_tickers():
         if tables and len(tables) > 0 and 'Symbol' in tables[0].columns:
             tickers = tables[0]['Symbol'].tolist()
             if tickers:
-                st.success(f"✅ Loaded {len(tickers)} S&P 400 tickers from Wikipedia")
                 return tickers
     except requests.exceptions.Timeout:
         st.warning("⏱️ Wikipedia request timed out. Using fallback ticker list.")
@@ -44,8 +43,30 @@ def get_sp400_tickers():
     except Exception as e:
         st.warning(f"⚠️ Could not fetch S&P 400 from Wikipedia ({type(e).__name__}). Upload a CSV or use other sources.")
     
-    # Fallback: Return curated sample if Wikipedia fails
+    # Fallback: Return empty list if Wikipedia fails
     return []
+
+def validate_and_clean_tickers(ticker_list):
+    """
+    Clean and validate ticker list.
+    Removes None, empty strings, and non-string values.
+    Returns list of valid uppercase tickers.
+    """
+    if not isinstance(ticker_list, list):
+        return []
+    
+    valid_tickers = []
+    for ticker in ticker_list:
+        # Skip None values
+        if ticker is None:
+            continue
+        # Convert to string and strip whitespace
+        ticker_str = str(ticker).strip().upper()
+        # Skip empty strings
+        if ticker_str:
+            valid_tickers.append(ticker_str)
+    
+    return valid_tickers
 
 # Small-cap sample: you can replace this with a CSV read or an ETF holdings scrape
 SMALL_CAP_TICKERS = ['SITC', 'CRNC', 'AMSC', 'OSUR', 'AXNX', 'SMCI', 'CROX', 'MOD', 'QLYS']
@@ -240,8 +261,11 @@ with st.sidebar:
                     break
             
             if ticker_col:
-                uploaded_tickers = df_upload[ticker_col].str.upper().tolist()
-                st.success(f"✅ Loaded {len(uploaded_tickers)} tickers from file")
+                raw_tickers = df_upload[ticker_col].tolist()
+                uploaded_tickers = validate_and_clean_tickers(raw_tickers)
+                st.success(f"✅ Loaded {len(uploaded_tickers)} valid tickers from file")
+                if len(raw_tickers) != len(uploaded_tickers):
+                    st.info(f"ℹ️ Filtered out {len(raw_tickers) - len(uploaded_tickers)} invalid entries")
             else:
                 st.error(f"❌ CSV must have 'Symbol' or 'Ticker' column. Found: {list(df_upload.columns)}")
         except Exception as e:
@@ -263,53 +287,85 @@ if st.session_state.get('run_screen', False):
         if use_midcap:
             sp400_tickers = get_sp400_tickers()
             if sp400_tickers:
-                tickers.update(sp400_tickers)
+                clean_sp400 = validate_and_clean_tickers(sp400_tickers)
+                tickers.update(clean_sp400)
+                st.info(f"✅ Loaded {len(clean_sp400)} S&P 400 tickers")
             else:
                 st.warning("⚠️ S&P 400 tickers not available. Use other sources or upload a CSV.")
         
         if use_smallcap:
-            tickers.update(SMALL_CAP_TICKERS)
+            clean_small = validate_and_clean_tickers(SMALL_CAP_TICKERS)
+            tickers.update(clean_small)
+            st.info(f"✅ Loaded {len(clean_small)} small-cap tickers")
         
         if uploaded_tickers:
             tickers.update(uploaded_tickers)
         
         if custom_tickers:
-            tickers.update([t.strip().upper() for t in custom_tickers.split(',') if t.strip()])
+            custom_list = [t.strip().upper() for t in custom_tickers.split(',') if t.strip()]
+            clean_custom = validate_and_clean_tickers(custom_list)
+            tickers.update(clean_custom)
+            st.info(f"✅ Loaded {len(clean_custom)} custom tickers")
 
         tickers = list(tickers)
         
         if not tickers:
-            st.error("❌ No tickers selected. Please select at least one source.")
+            st.error("❌ No valid tickers selected. Please select at least one source.")
         else:
-            st.write(f"Checking {len(tickers)} tickers...")
+            st.write(f"Screening {len(tickers)} tickers...")
 
             results = []
             progress = st.progress(0)
+            failed_tickers = []
+            
             for i, ticker in enumerate(tickers):
                 progress.progress((i + 1) / len(tickers))
+                
                 # Market cap filter
-                mkt_cap = get_market_cap(ticker)
-                if mkt_cap is None or mkt_cap < market_cap_min or mkt_cap > market_cap_max:
+                try:
+                    mkt_cap = get_market_cap(ticker)
+                    if mkt_cap is None or mkt_cap < market_cap_min or mkt_cap > market_cap_max:
+                        continue
+                except Exception as e:
+                    failed_tickers.append((ticker, str(e)))
                     continue
+                
                 # FCF yield
-                fy = fcf_yield(ticker)
-                if fy is None or fy < min_fcf_yield:
+                try:
+                    fy = fcf_yield(ticker)
+                    if fy is None or fy < min_fcf_yield:
+                        continue
+                except Exception as e:
+                    failed_tickers.append((ticker, str(e)))
                     continue
-                company_name = get_company_name(ticker)
-                results.append({
-                    'Ticker': ticker,
-                    'Company': company_name,
-                    'Market Cap ($M)': mkt_cap / 1e6,
-                    'FCF/EV Yield (%)': round(fy, 2)
-                })
+                
+                try:
+                    company_name = get_company_name(ticker)
+                    results.append({
+                        'Ticker': ticker,
+                        'Company': company_name,
+                        'Market Cap ($M)': mkt_cap / 1e6,
+                        'FCF/EV Yield (%)': round(fy, 2)
+                    })
+                except Exception as e:
+                    failed_tickers.append((ticker, str(e)))
+                    continue
 
             if results:
                 df = pd.DataFrame(results).sort_values('FCF/EV Yield (%)', ascending=False)
                 st.session_state.screen_results = df
                 st.success(f"✅ Found {len(df)} opportunities.")
             else:
-                st.warning("No stocks matched the criteria.")
+                st.warning("❌ No stocks matched the criteria.")
                 st.session_state.screen_results = pd.DataFrame()
+            
+            # Show summary of failed tickers
+            if failed_tickers:
+                with st.expander(f"ℹ️ {len(failed_tickers)} tickers failed to fetch (click to see)"):
+                    for ticker, error in failed_tickers[:10]:  # Show first 10
+                        st.caption(f"🔴 {ticker}: {error[:80]}")
+                    if len(failed_tickers) > 10:
+                        st.caption(f"... and {len(failed_tickers) - 10} more")
 
 # Display screening results if available
 if 'screen_results' in st.session_state and not st.session_state.screen_results.empty:
